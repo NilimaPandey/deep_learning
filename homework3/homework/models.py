@@ -156,10 +156,23 @@ class Detector(torch.nn.Module):
 
         # Decoder with skip connections
         u3 = self.up3(b)  # (B, 64, H/4, W/4)
+        # Debug shapes before concatenation
+        if u3.shape[2:] != d3.shape[2:]:
+            print(f"Shape mismatch before cat u3/d3: u3 {u3.shape}, d3 {d3.shape}")
+            import torch.nn.functional as F
+            d3 = F.interpolate(d3, size=u3.shape[2:], mode='nearest')
         u3 = torch.cat([u3, d3], dim=1)  # (B, 128, H/4, W/4)
         u2 = self.up2(u3)  # (B, 32, H/2, W/2)
+        if u2.shape[2:] != d2.shape[2:]:
+            print(f"Shape mismatch before cat u2/d2: u2 {u2.shape}, d2 {d2.shape}")
+            import torch.nn.functional as F
+            d2 = F.interpolate(d2, size=u2.shape[2:], mode='nearest')
         u2 = torch.cat([u2, d2], dim=1)  # (B, 64, H/2, W/2)
         u1 = self.up1(u2)  # (B, 16, H, W)
+        if u1.shape[2:] != d1.shape[2:]:
+            print(f"Shape mismatch before cat u1/d1: u1 {u1.shape}, d1 {d1.shape}")
+            import torch.nn.functional as F
+            d1 = F.interpolate(d1, size=u1.shape[2:], mode='nearest')
         u1 = torch.cat([u1, d1], dim=1)  # (B, 32, H, W)
 
         logits = self.segmentation_head(u1)  # (B, num_classes, H, W)
