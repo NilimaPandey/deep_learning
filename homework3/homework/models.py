@@ -158,7 +158,7 @@ class Detector(torch.nn.Module):
         u3 = self.up3(b)  # (B, 64, H/4, W/4)
         print(f"u3 shape: {u3.shape}, d3 shape: {d3.shape}")
         if u3.shape[2:] != d3.shape[2:]:
-            print(f"Shape mismatch before cat u3/d3: u3 {u3.shape}, d3 {d3.shape}")
+            # print(f"Shape mismatch before cat u3/d3: u3 {u3.shape}, d3 {d3.shape}")
             import torch.nn.functional as F
             d3 = F.interpolate(d3, size=u3.shape[2:], mode='nearest')
         u3 = torch.cat([u3, d3], dim=1)  # (B, 128, H/4, W/4)
