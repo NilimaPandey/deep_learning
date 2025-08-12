@@ -60,18 +60,58 @@ class TransformerPlanner(nn.Module):
         return self.out_proj(hs)
 
 # ---------------- CNN ----------------
+import torch
+import torch.nn as nn
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        return self.block(x)
+
 class CNNPlanner(nn.Module):
+    """
+    Simple CNN: image -> waypoints (B, n_waypoints, 2).
+    Assumes the dataloader already:
+      - converts to CHW torch.float32,
+      - normalizes to ImageNet mean/std.
+    """
     def __init__(self, n_waypoints: int = 3):
         super().__init__()
         self.n_waypoints = n_waypoints
-        # (keep the backbone/head exactly as you have)
 
-    def forward(self, image):
-        # image is already CHW float and normalized by the pipeline
-        x = image
+        # Feature extractor
+        self.backbone = nn.Sequential(
+            ConvBlock(3, 32, s=2),     # 1/2
+            ConvBlock(32, 32),
+            ConvBlock(32, 64, s=2),    # 1/4
+            ConvBlock(64, 64),
+            ConvBlock(64, 128, s=2),   # 1/8
+            ConvBlock(128, 128),
+            ConvBlock(128, 256, s=2),  # 1/16
+            ConvBlock(256, 256),
+        )
+
+        # Regressor head
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(256, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, n_waypoints * 2),
+        )
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        x = image  # already normalized by pipeline
         feats = self.backbone(x)
-        out = self.head(feats)
+        out = self.head(feats)                          # (B, 2*n_waypoints)
         return out.view(image.size(0), self.n_waypoints, 2)
+
 
 
 MODEL_FACTORY = {
