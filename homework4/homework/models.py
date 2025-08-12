@@ -200,3 +200,18 @@ def save_model(model: nn.Module) -> str:
     output_path = HOMEWORK_DIR / f"{model_name}.th"
     torch.save(model.state_dict(), output_path)
     return str(output_path)
+
+
+def load_model(model_name: str, checkpoint_path: str | None = None, map_location: str | None = None) -> nn.Module:
+    """Build a model by name and (optionally) load weights from a checkpoint path.
+    Returns the model in eval mode.
+    """
+    device = map_location or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(model_name)
+    if checkpoint_path:
+        state = torch.load(checkpoint_path, map_location=device)
+        # allow strict=True; change to False if student checkpoints mismatch marginally
+        model.load_state_dict(state, strict=True)
+    model.to(device)
+    model.eval()
+    return model
