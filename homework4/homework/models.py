@@ -60,57 +60,73 @@ class TransformerPlanner(nn.Module):
         return self.out_proj(hs)
 
 # ---------------- CNN ----------------
+# --- in homework/models.py ---
 import torch
 import torch.nn as nn
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
+class BasicBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False),
+        self.down = None
+        if stride != 1 or in_ch != out_ch:
+            self.down = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, stride, 1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
         )
+        self.relu = nn.ReLU(inplace=True)
+
     def forward(self, x):
-        return self.block(x)
+        y = self.conv(x)
+        if self.down is not None:
+            x = self.down(x)
+        return self.relu(x + y)
 
 class CNNPlanner(nn.Module):
     """
-    Simple CNN: image -> waypoints (B, n_waypoints, 2).
-    Assumes the dataloader already:
-      - converts to CHW torch.float32,
-      - normalizes to ImageNet mean/std.
+    Image-only planner: image (B,3,H,W) -> waypoints (B, n_wp, 2)
+    Assumes the dataloader already converted to CHW float and normalized (ImageNet mean/std).
     """
     def __init__(self, n_waypoints: int = 3):
         super().__init__()
         self.n_waypoints = n_waypoints
 
-        # Feature extractor
-        self.backbone = nn.Sequential(
-            ConvBlock(3, 32, s=2),     # 1/2
-            ConvBlock(32, 32),
-            ConvBlock(32, 64, s=2),    # 1/4
-            ConvBlock(64, 64),
-            ConvBlock(64, 128, s=2),   # 1/8
-            ConvBlock(128, 128),
-            ConvBlock(128, 256, s=2),  # 1/16
-            ConvBlock(256, 256),
-        )
+        # Stem
+        layers = [
+            nn.Conv2d(3, 32, 3, 2, 1, bias=False),  # 1/2
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        ]
+        # 1/4, 1/8, 1/16 stages with residual blocks
+        channels = [32, 64, 128, 256]
+        strides  = [1,   2,   2,   2]
+        in_ch = 32
+        for out_ch, s in zip(channels, strides):
+            layers += [BasicBlock(in_ch, out_ch, stride=s), BasicBlock(out_ch, out_ch, stride=1)]
+            in_ch = out_ch
+        self.backbone = nn.Sequential(*layers)
 
-        # Regressor head
+        # Head
         self.head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(256, 256),
             nn.ReLU(inplace=True),
+            nn.Dropout(p=0.2),
             nn.Linear(256, n_waypoints * 2),
         )
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
-        x = image  # already normalized by pipeline
-        feats = self.backbone(x)
-        out = self.head(feats)                          # (B, 2*n_waypoints)
+        x = self.backbone(image)
+        out = self.head(x)
         return out.view(image.size(0), self.n_waypoints, 2)
+
 
 
 
