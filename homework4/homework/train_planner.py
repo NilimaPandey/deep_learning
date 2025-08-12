@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from .models import build_model, save_model
 from .metrics import PlannerMetric
-from .road_dataset import RoadDataset
+from .datasets.road_dataset import RoadDataset
 
 def collate_batch(batch):
     # Convert lists of dicts to batched tensors
