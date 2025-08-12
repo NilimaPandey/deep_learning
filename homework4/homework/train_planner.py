@@ -127,7 +127,9 @@ def train(
     train_loader = make_loader(train_split, transform_pipeline, batch_size, num_workers, shuffle=True)
     val_loader = make_loader(val_split, transform_pipeline, batch_size, num_workers, shuffle=False)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    # CHANGED: add weight decay + cosine schedule
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epoch)
 
     best_l1 = float("inf")
     best_path = None
@@ -135,12 +137,16 @@ def train(
         tr_stats = train_one_epoch(model, train_loader, optimizer, device)
         va_stats = evaluate(model, val_loader, device)
 
+        scheduler.step()  # CHANGED: step the LR schedule
+
+        cur_lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch:03d} | "
             f"train loss {tr_stats['loss']:.4f} L1 {tr_stats['l1_error']:.3f} "
             f"(long {tr_stats['longitudinal_error']:.3f} lat {tr_stats['lateral_error']:.3f}) | "
             f"val loss {va_stats['loss']:.4f} L1 {va_stats['l1_error']:.3f} "
-            f"(long {va_stats['longitudinal_error']:.3f} lat {va_stats['lateral_error']:.3f})"
+            f"(long {va_stats['longitudinal_error']:.3f} lat {va_stats['lateral_error']:.3f}) | "
+            f"lr {cur_lr:.2e}"
         )
 
         if save and va_stats["l1_error"] < best_l1:
@@ -153,6 +159,7 @@ def train(
         print(f"Saved model to {best_path}")
 
     return va_stats
+
 
 
 def main():
