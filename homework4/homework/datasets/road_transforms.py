@@ -263,3 +263,26 @@ class EgoTrackProcessor:
             "waypoints": waypoints.astype(np.float32),
             "waypoints_mask": waypoints_mask,
         }
+import torch
+from torchvision import transforms
+from homework.models import INPUT_MEAN, INPUT_STD
+
+class NormalizeImage(object):
+    """
+    Normalize a 3xHxW image tensor using predefined dataset mean and std.
+    """
+    def __init__(self, mean=INPUT_MEAN, std=INPUT_STD):
+        self.mean = mean
+        self.std = std
+        self.transform = transforms.Normalize(mean=mean, std=std)
+
+    def __call__(self, sample):
+        # sample can be a tensor (C,H,W) or a dict with 'image' key
+        if torch.is_tensor(sample):
+            return self.transform(sample)
+        elif isinstance(sample, dict) and 'image' in sample:
+            sample['image'] = self.transform(sample['image'])
+            return sample
+        else:
+            raise TypeError(f"Unsupported type for NormalizeImage: {type(sample)}")
+
