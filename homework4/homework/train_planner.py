@@ -1,13 +1,6 @@
-<<<<<<< HEAD
-
 from __future__ import annotations
 import argparse
 
-=======
-from __future__ import annotations
-import argparse
-
->>>>>>> f204bfa32520e8ba6b454204c5b43545d3fe1644
 import torch
 from torch.utils.data import DataLoader
 
@@ -17,7 +10,7 @@ from .datasets.road_dataset import RoadDataset
 
 
 def collate_batch(batch):
-    # Convert list[dict] -> dict[str, tensor/list]
+    """Convert list[dict] -> dict[str, tensor/list] for DataLoader."""
     out = {}
     for key in batch[0].keys():
         vals = [b[key] for b in batch]
@@ -41,7 +34,7 @@ def make_loader(split_path: str, transform_pipeline: str, batch_size: int, num_w
 
 
 def masked_mse_loss(preds: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    # preds/targets: (B, n, 2), mask: (B, n)
+    """MSE averaged only over valid (masked) waypoints."""
     diff2 = (preds - targets) ** 2  # (B, n, 2)
     mask2 = mask.unsqueeze(-1).to(diff2.dtype)
     diff2 = diff2 * mask2
@@ -57,7 +50,7 @@ def train_one_epoch(model, loader, optimizer, device):
     for batch in loader:
         optimizer.zero_grad(set_to_none=True)
 
-        # Determine model inputs by class
+        # Choose inputs by model type
         if model.__class__.__name__ == "CNNPlanner":
             images = batch["image"].to(device, non_blocking=True)  # (B, 3, H, W)
             preds = model(images)
@@ -120,18 +113,14 @@ def train(
     val_split: str = "drive_data/val",
     save: bool = True,
 ):
-<<<<<<< HEAD
-    """Programmatic training entrypoint (for Colab). Returns final val stats dict."""
-=======
     """
     Programmatic training entrypoint (for Colab).
     Returns the final validation stats dict.
     """
->>>>>>> f204bfa32520e8ba6b454204c5b43545d3fe1644
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(model_name).to(device)
 
-    # Choose transform pipeline
+    # Default: state_only for state models, image "default" for CNN
     if transform_pipeline is None:
         transform_pipeline = "default" if model_name == "cnn_planner" else "state_only"
 
