@@ -266,18 +266,44 @@ class EgoTrackProcessor:
 
 
 class NormalizeImage:
-    """Normalize 'image' in sample dict using mean/std."""
-    def __init__(self, mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)):
-        import numpy as np
-        self.mean = np.array(mean, dtype=np.float32)[None, None, :]
-        self.std = np.array(std, dtype=np.float32)[None, None, :]
+    """
+    Normalizes images to ImageNet mean/std.
+    Accepts either HWC numpy in [0,255]/[0,1] or CHW torch tensor.
+    Outputs a CHW torch.float32 tensor.
+    """
+    def __init__(self, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+        import torch
+        self.mean = torch.tensor(mean, dtype=torch.float32).view(3, 1, 1)
+        self.std = torch.tensor(std, dtype=torch.float32).view(3, 1, 1)
+
     def __call__(self, sample: dict):
-        if 'image' in sample and sample['image'] is not None:
-            img = sample['image'].astype('float32')
+        import numpy as np, torch
+        img = sample.get("image", None)
+        if img is None:
+            return sample
+
+        # Convert to torch CHW float32 in [0,1]
+        if isinstance(img, np.ndarray):
+            img = img.astype("float32")
+            if img.ndim == 3 and img.shape[-1] == 3:  # HWC -> CHW
+                img = np.transpose(img, (2, 0, 1))
             if img.max() > 1.0:
                 img = img / 255.0
-            sample['image'] = (img - self.mean) / self.std
+            img = torch.from_numpy(img)
+        elif torch.is_tensor(img):
+            img = img.float()
+            if img.ndim == 3 and img.shape[-1] == 3:  # HWC tensor -> CHW
+                img = img.permute(2, 0, 1).contiguous()
+            if img.max().item() > 1.0:
+                img = img / 255.0
+        else:
+            return sample  # unknown type, skip
+
+        # Normalize
+        img = (img - self.mean.to(img.device)) / self.std.to(img.device)
+        sample["image"] = img
         return sample
+
 
 class ToTensor:
     """Convert arrays in sample dict to torch tensors with channels-first for 'image'."""
