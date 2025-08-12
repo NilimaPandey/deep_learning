@@ -1,239 +1,159 @@
-"""
-Usage:
-    python3 -m homework.train_planner \
-        --model mlp_planner \
-        --train_split drive_data/train \
-        --val_split drive_data/val \
-        --epochs 20 --batch_size 128 --lr 1e-3
 
-Models:
-    - mlp_planner (Part 1a)
-    - transformer_planner (Part 1b)
-    - cnn_planner (Part 2)
+"""Train planners for Homework 4.
+Usage examples:
+  python3 -m homework.train_planner --model mlp_planner --epochs 40 --batch_size 128 --lr 1e-3 --save
+  python3 -m homework.train_planner --model transformer_planner --epochs 60 --batch_size 128 --lr 3e-4 --save
+  python3 -m homework.train_planner --model cnn_planner --epochs 40 --batch_size 64 --lr 1e-3 --save
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
-from typing import Literal
+from typing import Tuple
 
 import torch
-from torch import nn
+import torch.nn as nn
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
-from .datasets.road_dataset import load_data
+# Local imports
+from .models import MLPPlanner, TransformerPlanner, CNNPlanner, save_model, calculate_model_size_mb
 from .metrics import PlannerMetric
-from .models import load_model, save_model
+from .datasets.road_dataset import RoadDataset
+from .datasets.road_transforms import EgoTrackProcessor, NormalizeImage, ToTensor
 
 
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        return torch.device("mps")
-    return torch.device("cpu")
+def get_model(name: str) -> nn.Module:
+    name = name.lower()
+    if name == "mlp_planner":
+        return MLPPlanner()
+    if name == "transformer_planner":
+        return TransformerPlanner()
+    if name == "cnn_planner":
+        return CNNPlanner()
+    raise ValueError(f"Unknown model '{name}'")
 
 
-def masked_l1(preds: torch.Tensor, labels: torch.Tensor, labels_mask: torch.Tensor) -> torch.Tensor:
-    # preds, labels: (b, n, 2), mask: (b, n)
-    error = (preds - labels).abs()
-    error = error * labels_mask[..., None]
-    denom = labels_mask.sum().clamp_min(1).to(error.dtype)
-    return error.sum() / denom
+def get_loss() -> nn.Module:
+    # Waypoints are real-valued -> L1 works well for coordinates
+    return nn.L1Loss(reduction="none")
 
 
-def get_transform_pipeline(model_name: str) -> str:
-    if model_name in ("mlp_planner", "transformer_planner"):
-        return "state_only"
-    elif model_name == "cnn_planner":
-        return "default"
-    else:
-        raise ValueError(f"Unknown model {model_name}")
+def collate_tracks(batch):
+    # Each item is a dict from RoadDataset
+    # We'll return what each model needs in a consistent structure.
+    out = {}
+    keys = batch[0].keys()
+    for k in keys:
+        out[k] = [b[k] for b in batch]
+
+    def stack_if_tensor(key):
+        if torch.is_tensor(out[key][0]):
+            out[key] = torch.stack(out[key], dim=0)
+
+    for k in ["track_left", "track_right", "waypoints", "waypoints_mask"]:
+        stack_if_tensor(k)
+
+    # Images (for CNN) if provided by dataset transform
+    if "image" in out and torch.is_tensor(out["image"][0]):
+        out["image"] = torch.stack(out["image"], dim=0)
+
+    return out
 
 
-def forward_for_model(model_name: str, model: nn.Module, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-    if model_name in ("mlp_planner", "transformer_planner"):
-        return model(batch["track_left"], batch["track_right"])  # (b, n, 2)
-    elif model_name == "cnn_planner":
-        return model(batch["image"])  # (b, n, 2)
-    else:
-        raise ValueError(f"Unknown model {model_name}")
+def build_loaders(train_split: str, val_split: str, model_name: str, batch_size: int, num_workers: int) -> Tuple[DataLoader, DataLoader]:
+    # Transforms: leverage the dataset's helper to build correct egocentric tracks
+    # For CNN, also include image normalization
+    track_tf = EgoTrackProcessor()
+    img_tf = [ToTensor(), NormalizeImage()]
+
+    train_ds = RoadDataset(split=train_split, track_transform=track_tf, image_transform=img_tf)
+    val_ds = RoadDataset(split=val_split, track_transform=track_tf, image_transform=img_tf)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_tracks, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_tracks, pin_memory=True)
+    return train_loader, val_loader
 
 
-def run_epoch(
-    model_name: str,
-    model: nn.Module,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer | None,
-    device: torch.device,
-    desc: str,
-) -> tuple[float, dict[str, float]]:
+def run_epoch(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, optimizer: torch.optim.Optimizer | None, device: torch.device, model_name: str) -> dict:
     is_train = optimizer is not None
     model.train(is_train)
-
-    total_loss = 0.0
     metric = PlannerMetric()
 
-    pbar = tqdm(dataloader, desc=desc, leave=False)
-    for batch in pbar:
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+    for batch in loader:
+        # Move tensors to device
+        for k in ["track_left", "track_right", "waypoints", "waypoints_mask", "image"]:
+            if k in batch and torch.is_tensor(batch[k]):
+                batch[k] = batch[k].to(device, non_blocking=True)
 
-        with torch.set_grad_enabled(is_train):
-            preds = forward_for_model(model_name, model, batch)
-            loss = masked_l1(preds, batch["waypoints"], batch["waypoints_mask"])
+        # Forward based on model type
+        if isinstance(model, CNNPlanner):
+            preds = model(batch["image"])  # (B, n_waypoints, 2)
+        else:
+            preds = model(batch["track_left"], batch["track_right"])
 
-            if is_train:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+        labels = batch["waypoints"]
+        mask = batch["waypoints_mask"].bool()
 
-        total_loss += float(loss.item()) * preds.shape[0]
-        metric.add(preds, batch["waypoints"], batch["waypoints_mask"])
+        # Loss (element-wise), then mask and average
+        loss_elems = loss_fn(preds, labels)  # (B, n_wp, 2)
+        loss_mask = mask.unsqueeze(-1).expand_as(loss_elems)
+        loss = loss_elems[loss_mask].mean() if loss_mask.any() else loss_elems.mean()
 
-        cur = metric.compute()
-        pbar.set_postfix({"loss": f"{loss.item():.4f}", "lon": f"{cur['longitudinal_error']:.3f}", "lat": f"{cur['lateral_error']:.3f}"})
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
-    n_samples = len(dataloader.dataset) if hasattr(dataloader, "dataset") else 1
-    avg_loss = total_loss / max(n_samples, 1)
-    return avg_loss, metric.compute()
+        metric.update(preds.detach(), labels.detach(), mask.detach())
 
-
-def train(
-    model_name: str,
-    transform_pipeline: str | None = None,
-    num_workers: int = 2,
-    lr: float = 1e-3,
-    batch_size: int = 128,
-    num_epoch: int = 20,
-    train_split: str = "drive_data/train",
-    val_split: str = "drive_data/val",
-    seed: int = 2024,
-    save: bool = True,
-):
-    """Programmatic training API for Colab or notebooks.
-
-    Returns best validation metrics as a dict.
-    """
-    torch.manual_seed(seed)
-    device = get_device()
-
-    transform = transform_pipeline or get_transform_pipeline(model_name)
-    train_loader = load_data(
-        train_split,
-        transform_pipeline=transform,
-        return_dataloader=True,
-        num_workers=num_workers,
-        batch_size=batch_size,
-        shuffle=True,
-    )
-    val_loader = load_data(
-        val_split,
-        transform_pipeline=transform,
-        return_dataloader=True,
-        num_workers=num_workers,
-        batch_size=batch_size,
-        shuffle=False,
-    )
-
-    model = load_model(model_name, with_weights=False).to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epoch)
-
-    best_val = math.inf
-    best_metrics: dict[str, float] | None = None
-
-    for epoch in range(1, num_epoch + 1):
-        print(f"Epoch {epoch}/{num_epoch}")
-        train_loss, train_metrics = run_epoch(model_name, model, train_loader, optimizer, device, desc="train")
-        val_loss, val_metrics = run_epoch(model_name, model, val_loader, None, device, desc="val")
-
-        print(f"  train: loss={train_loss:.4f} lon={train_metrics['longitudinal_error']:.3f} lat={train_metrics['lateral_error']:.3f}")
-        print(f"  val  : loss={val_loss:.4f} lon={val_metrics['longitudinal_error']:.3f} lat={val_metrics['lateral_error']:.3f}")
-
-        lr_scheduler.step()
-
-        if val_loss < best_val:
-            best_val = val_loss
-            best_metrics = val_metrics
-            if save:
-                out_path = save_model(model)
-                print(f"  Saved checkpoint to {out_path}")
-
-    return best_metrics or {}
+    return metric.compute()
 
 
 def main():
-    parser = argparse.ArgumentParser("Train planners for Homework 4")
-    parser.add_argument("--model", type=str, default="mlp_planner", choices=["mlp_planner", "transformer_planner", "cnn_planner"]) 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, required=True, choices=["mlp_planner", "transformer_planner", "cnn_planner"])
     parser.add_argument("--train_split", type=str, default="drive_data/train")
     parser.add_argument("--val_split", type=str, default="drive_data/val")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=2024)
-    parser.add_argument("--no_save", action="store_true")
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--save", action="store_true")
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = get_model(args.model).to(device)
 
-    device = get_device()
-    print(f"Using device: {device}")
-
-    transform = get_transform_pipeline(args.model)
-    train_loader = load_data(
-        args.train_split,
-        transform_pipeline=transform,
-        return_dataloader=True,
-        num_workers=args.num_workers,
-        batch_size=args.batch_size,
-        shuffle=True,
-    )
-    val_loader = load_data(
-        args.val_split,
-        transform_pipeline=transform,
-        return_dataloader=True,
-        num_workers=args.num_workers,
-        batch_size=args.batch_size,
-        shuffle=False,
-    )
-
-    model = load_model(args.model, with_weights=False)
-    model.to(device)
-
+    loss_fn = get_loss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    best_val = math.inf
-    best_metrics: dict[str, float] | None = None
+    train_loader, val_loader = build_loaders(args.train_split, args.val_split, args.model, args.batch_size, args.num_workers)
 
+    best_val = float("inf")
+    best_stats = None
     for epoch in range(1, args.epochs + 1):
-        print(f"Epoch {epoch}/{args.epochs}")
-        train_loss, train_metrics = run_epoch(args.model, model, train_loader, optimizer, device, desc="train")
-        val_loss, val_metrics = run_epoch(args.model, model, val_loader, None, device, desc="val")
+        train_stats = run_epoch(model, train_loader, loss_fn, optimizer, device, args.model)
+        val_stats = run_epoch(model, val_loader, loss_fn, None, device, args.model)
 
-        print(f"  train: loss={train_loss:.4f} lon={train_metrics['longitudinal_error']:.3f} lat={train_metrics['lateral_error']:.3f}")
-        print(f"  val  : loss={val_loss:.4f} lon={val_metrics['longitudinal_error']:.3f} lat={val_metrics['lateral_error']:.3f}")
+        msg = (f"Epoch {epoch:03d} | Train L1: {train_stats['l1_error']:.4f} "
+               f"(Long {train_stats['longitudinal_error']:.4f}, Lat {train_stats['lateral_error']:.4f}) | "
+               f"Val L1: {val_stats['l1_error']:.4f} "
+               f"(Long {val_stats['longitudinal_error']:.4f}, Lat {val_stats['lateral_error']:.4f})")
+        print(msg)
 
-        lr_scheduler.step()
+        if val_stats['l1_error'] < best_val:
+            best_val = val_stats['l1_error']
+            best_stats = val_stats
+            if args.save:
+                path = save_model(model)
+                print(f"Saved best model -> {path}")
 
-        if val_loss < best_val:
-            best_val = val_loss
-            best_metrics = val_metrics
-            if not args.no_save:
-                out_path = save_model(model)
-                print(f"  Saved checkpoint to {out_path}")
-
-    if best_metrics is not None:
-        print(
-            f"Best val: lon={best_metrics['longitudinal_error']:.3f} lat={best_metrics['lateral_error']:.3f} l1={best_metrics['l1_error']:.3f}"
-        )
+    print("\nTraining complete.")
+    print(f"Best Val -> L1: {best_val:.4f}; details: {best_stats}")
+    print(f"Model size ~ {calculate_model_size_mb(model):.2f} MB")
 
 
 if __name__ == "__main__":
