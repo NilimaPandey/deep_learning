@@ -109,11 +109,12 @@ class RoadDataset(Dataset):
         # Compose transform
         if transform_pipeline == "default":
             self.transform = road_transforms.Compose([
-                road_transforms.ImageLoader(self.episode_dirs[0]),      # episode set in __getitem__
+                road_transforms.ImageLoader(self.episode_dirs[0]),
                 road_transforms.EgoTrackProcessor(self.episode_tracks[0]),
-                road_transforms.NormalizeImage(),
-                road_transforms.ToTensor(),
-            ])
+                road_transforms.ToTensor(),       # tensor first
+                road_transforms.NormalizeImage(), # then normalize
+                ])
+
         elif transform_pipeline == "state_only":
             self.transform = road_transforms.Compose([
                 road_transforms.EgoTrackProcessor(self.episode_tracks[0]),
@@ -140,8 +141,9 @@ class RoadDataset(Dataset):
         # Point transforms to the current episode + track
         for t in getattr(self.transform, "transforms", []):
             if isinstance(t, road_transforms.ImageLoader):
-                t.episode_path = Path(ep)
+                t.episode_path = Path(episode_path)
             if isinstance(t, road_transforms.EgoTrackProcessor):
                 t.track = track
+
 
         return self.transform(sample)
