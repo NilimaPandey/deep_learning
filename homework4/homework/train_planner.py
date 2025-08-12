@@ -1,7 +1,13 @@
+<<<<<<< HEAD
 
 from __future__ import annotations
 import argparse
 
+=======
+from __future__ import annotations
+import argparse
+
+>>>>>>> f204bfa32520e8ba6b454204c5b43545d3fe1644
 import torch
 from torch.utils.data import DataLoader
 
@@ -114,7 +120,14 @@ def train(
     val_split: str = "drive_data/val",
     save: bool = True,
 ):
+<<<<<<< HEAD
     """Programmatic training entrypoint (for Colab). Returns final val stats dict."""
+=======
+    """
+    Programmatic training entrypoint (for Colab).
+    Returns the final validation stats dict.
+    """
+>>>>>>> f204bfa32520e8ba6b454204c5b43545d3fe1644
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(model_name).to(device)
 
