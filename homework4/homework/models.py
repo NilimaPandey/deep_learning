@@ -1,225 +1,202 @@
+
+from __future__ import annotations
+import math
 from pathlib import Path
+from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+# Directory to save checkpoints
 HOMEWORK_DIR = Path(__file__).resolve().parent
-INPUT_MEAN = [0.2788, 0.2657, 0.2629]
-INPUT_STD = [0.2064, 0.1944, 0.2252]
+
+# -------------------------
+# MLP Planner
+# -------------------------
+
+
+class LinearPlanner(nn.Module):
+    """
+    Linear baseline: flattens left/right tracks and applies a single Linear layer.
+    """
+    def __init__(self, n_track: int = 10, n_waypoints: int = 3):
+        super().__init__()
+        in_dim = n_track * 2 * 2
+        out_dim = n_waypoints * 2
+        self.fc = nn.Linear(in_dim, out_dim)
+        self.n_waypoints = n_waypoints
+
+    def forward(self, track_left: torch.Tensor, track_right: torch.Tensor) -> torch.Tensor:
+        b = track_left.size(0)
+        x = torch.cat([track_left, track_right], dim=1).reshape(b, -1)
+        out = self.fc(x)  # (B, 2*n_waypoints)
+        return out.view(b, self.n_waypoints, 2)
 
 
 class MLPPlanner(nn.Module):
-    def __init__(
-        self,
-        n_track: int = 10,
-        n_waypoints: int = 3,
-    ):
-        """
-        Args:
-            n_track (int): number of points in each side of the track
-            n_waypoints (int): number of waypoints to predict
-        """
+    """
+    Predict n_waypoints 2D future positions from left/right lane boundaries.
+    Inputs:
+        track_left:  (B, n_track, 2)
+        track_right: (B, n_track, 2)
+    Output:
+        waypoints: (B, n_waypoints, 2)
+    """
+    def __init__(self, n_track: int = 10, n_waypoints: int = 3, hidden: Tuple[int, ...] = (128, 256, 128)):
         super().__init__()
+        in_dim = n_track * 2 * 2  # left/right * (x,y)
+        out_dim = n_waypoints * 2
 
-        self.n_track = n_track
+        layers = []
+        prev = in_dim
+        for h in hidden:
+            layers += [nn.Linear(prev, h), nn.ReLU(inplace=True)]
+            prev = h
+        layers += [nn.Linear(prev, out_dim)]
+        self.net = nn.Sequential(*layers)
         self.n_waypoints = n_waypoints
 
-    def forward(
-        self,
-        track_left: torch.Tensor,
-        track_right: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Predicts waypoints from the left and right boundaries of the track.
+    def forward(self, track_left: torch.Tensor, track_right: torch.Tensor) -> torch.Tensor:
+        b = track_left.size(0)
+        x = torch.cat([track_left, track_right], dim=1)  # (B, 2*n_track, 2)
+        x = x.reshape(b, -1)  # (B, 4*n_track)
+        out = self.net(x)  # (B, 2*n_waypoints)
+        return out.view(b, self.n_waypoints, 2)
 
-        During test time, your model will be called with
-        model(track_left=..., track_right=...), so keep the function signature as is.
 
-        Args:
-            track_left (torch.Tensor): shape (b, n_track, 2)
-            track_right (torch.Tensor): shape (b, n_track, 2)
-
-        Returns:
-            torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
-        """
-        raise NotImplementedError
-
+# -------------------------
+# Transformer Planner
+# -------------------------
 
 class TransformerPlanner(nn.Module):
+    """
+    Perceiver-style cross-attention: learned waypoint queries attend over lane boundary tokens.
+    """
     def __init__(
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
-        d_model: int = 64,
+        d_model: int = 128,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
     ):
         super().__init__()
-
-        self.n_track = n_track
         self.n_waypoints = n_waypoints
 
+        # Encode inputs (left/right tracks) -> tokens of dim d_model
+        self.input_proj = nn.Linear(2, d_model)  # (x,y) -> token
+        self.pos_left = nn.Parameter(torch.randn(1, n_track, d_model) * 0.02)
+        self.pos_right = nn.Parameter(torch.randn(1, n_track, d_model) * 0.02)
+
+        # Learned queries for n_waypoints
         self.query_embed = nn.Embedding(n_waypoints, d_model)
 
-    def forward(
-        self,
-        track_left: torch.Tensor,
-        track_right: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Predicts waypoints from the left and right boundaries of the track.
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        During test time, your model will be called with
-        model(track_left=..., track_right=...), so keep the function signature as is.
+        self.out_proj = nn.Linear(d_model, 2)
 
-        Args:
-            track_left (torch.Tensor): shape (b, n_track, 2)
-            track_right (torch.Tensor): shape (b, n_track, 2)
+    def forward(self, track_left: torch.Tensor, track_right: torch.Tensor) -> torch.Tensor:
+        # tracks: (B, n_track, 2)
+        tl = self.input_proj(track_left) + self.pos_left  # (B, n_track, d)
+        tr = self.input_proj(track_right) + self.pos_right  # (B, n_track, d)
+        mem = torch.cat([tl, tr], dim=1)  # (B, 2*n_track, d)
 
-        Returns:
-            torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
-        """
-        raise NotImplementedError
+        b = track_left.size(0)
+        queries = self.query_embed.weight.unsqueeze(0).expand(b, -1, -1)  # (B, n_waypoints, d)
+
+        hs = self.decoder(tgt=queries, memory=mem)  # (B, n_waypoints, d)
+        out = self.out_proj(hs)  # (B, n_waypoints, 2)
+        return out
 
 
-class CNNPlanner(torch.nn.Module):
-    def __init__(
-        self,
-        n_waypoints: int = 3,
-    ):
+# -------------------------
+# CNN Planner
+# -------------------------
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
         super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
 
+    def forward(self, x):
+        return self.block(x)
+
+
+class CNNPlanner(nn.Module):
+    """
+    Predict n_waypoints 2D positions from image (B, 3, 96, 128).
+    """
+    def __init__(self, n_waypoints: int = 3):
+        super().__init__()
         self.n_waypoints = n_waypoints
+        self.input_mean = torch.tensor([0.485, 0.456, 0.406])
+        self.input_std = torch.tensor([0.229, 0.224, 0.225])
 
-        self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN), persistent=False)
-        self.register_buffer("input_std", torch.as_tensor(INPUT_STD), persistent=False)
+        self.backbone = nn.Sequential(
+            ConvBlock(3, 32, s=2),    # 48x64
+            ConvBlock(32, 32),
+            ConvBlock(32, 64, s=2),   # 24x32
+            ConvBlock(64, 64),
+            ConvBlock(64, 128, s=2),  # 12x16
+            ConvBlock(128, 128),
+            ConvBlock(128, 256, s=2), # 6x8
+            ConvBlock(256, 256),
+        )
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # (B, C, 1, 1)
+            nn.Flatten(),
+            nn.Linear(256, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, n_waypoints * 2),
+        )
 
-    def forward(self, image: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Args:
-            image (torch.FloatTensor): shape (b, 3, h, w) and vals in [0, 1]
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        # Normalize to ImageNet stats (image expected in [0,1])
+        x = (image - self.input_mean[None, :, None, None].to(image.device)) / self.input_std[None, :, None, None].to(image.device)
+        feats = self.backbone(x)
+        out = self.head(feats)  # (B, 2*n_waypoints)
+        return out.view(image.size(0), self.n_waypoints, 2)
 
-        Returns:
-            torch.FloatTensor: future waypoints with shape (b, n, 2)
-        """
-        x = image
-        x = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        raise NotImplementedError
-
+# -------------------------
+# Factory and Save
+# -------------------------
 
 MODEL_FACTORY = {
+    'linear_planner': LinearPlanner,
     "mlp_planner": MLPPlanner,
     "transformer_planner": TransformerPlanner,
     "cnn_planner": CNNPlanner,
 }
 
 
-def load_model(
-    model_name: str,
-    with_weights: bool = False,
-    **model_kwargs,
-) -> torch.nn.Module:
+def build_model(name: str) -> nn.Module:
+    if name not in MODEL_FACTORY:
+        raise ValueError(f"Unknown model: {name}. Options: {list(MODEL_FACTORY)}")
+    return MODEL_FACTORY[name]()
+
+
+def save_model(model: nn.Module) -> str:
     """
-    Called by the grader to load a pre-trained model by name
-    """
-    m = MODEL_FACTORY[model_name](**model_kwargs)
-
-    if with_weights:
-        model_path = HOMEWORK_DIR / f"{model_name}.th"
-        assert model_path.exists(), f"{model_path.name} not found"
-
-        try:
-            m.load_state_dict(torch.load(model_path, map_location="cpu"))
-        except RuntimeError as e:
-            raise AssertionError(
-                f"Failed to load {model_path.name}, make sure the default model arguments are set correctly"
-            ) from e
-
-    # limit model sizes since they will be zipped and submitted
-    model_size_mb = calculate_model_size_mb(m)
-
-    if model_size_mb > 20:
-        raise AssertionError(f"{model_name} is too large: {model_size_mb:.2f} MB")
-
-    return m
-
-
-def save_model(model: torch.nn.Module) -> str:
-    """
-    Use this function to save your model in train.py
+    Save model state dict to homework/<model_name>.th and return path.
     """
     model_name = None
-
     for n, m in MODEL_FACTORY.items():
         if type(model) is m:
             model_name = n
-
+            break
     if model_name is None:
-        raise ValueError(f"Model type '{str(type(model))}' not supported")
-
+        raise ValueError(f"Unsupported model type: {type(model)}")
     output_path = HOMEWORK_DIR / f"{model_name}.th"
     torch.save(model.state_dict(), output_path)
-
-    return output_path
-
-
-def calculate_model_size_mb(model: torch.nn.Module) -> float:
-    """
-    Naive way to estimate model size
-    """
-    return sum(p.numel() for p in model.parameters()) * 4 / 1024 / 1024
-from typing import Union
-def load_model(what: Union[str, Path], device: torch.device | str | None = None) -> nn.Module:
-    """
-    Load a trained planner.
-
-    Args:
-        what: Either a model name {"mlp_planner","transformer_planner","cnn_planner"}
-              or a path to a checkpoint file (*.th).
-        device: torch.device or string ("cuda"/"cpu"), optional.
-
-    Returns:
-        An nn.Module moved to `device` and set to eval().
-    """
-    if isinstance(device, str):
-        device = torch.device(device)
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    def _make_from_name(name: str) -> nn.Module:
-        name = name.lower()
-        if name == "mlp_planner":
-            return MLPPlanner()
-        if name == "transformer_planner":
-            return TransformerPlanner()
-        if name == "cnn_planner":
-            return CNNPlanner()
-        raise ValueError(f"Unknown model name: {name}")
-
-    p = Path(what)
-    if p.exists():  # treat as checkpoint path
-        # Heuristic: infer class from filename; fallback to MLP
-        fname = p.name.lower()
-        if "transformer" in fname:
-            model = TransformerPlanner()
-        elif "cnn" in fname:
-            model = CNNPlanner()
-        elif "mlp" in fname or "planner" in fname:
-            model = MLPPlanner()
-        else:
-            # If your grader passes an explicit model name separately, you can change this.
-            model = MLPPlanner()
-        state = torch.load(p, map_location=device)
-        model.load_state_dict(state, strict=True)
-    else:
-        # treat `what` as a model name and load default checkpoint path
-        model = _make_from_name(what)
-        ckpt = HOMEWORK_DIR / f"{what.lower()}.th"
-        if not ckpt.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
-        state = torch.load(ckpt, map_location=device)
-        model.load_state_dict(state, strict=True)
-
-    model.to(device).eval()
-    return model
+    return str(output_path)
