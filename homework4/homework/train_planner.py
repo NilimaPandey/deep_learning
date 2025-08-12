@@ -102,6 +102,71 @@ def run_epoch(
     return avg_loss, metric.compute()
 
 
+def train(
+    model_name: str,
+    transform_pipeline: str | None = None,
+    num_workers: int = 2,
+    lr: float = 1e-3,
+    batch_size: int = 128,
+    num_epoch: int = 20,
+    train_split: str = "drive_data/train",
+    val_split: str = "drive_data/val",
+    seed: int = 2024,
+    save: bool = True,
+):
+    """Programmatic training API for Colab or notebooks.
+
+    Returns best validation metrics as a dict.
+    """
+    torch.manual_seed(seed)
+    device = get_device()
+
+    transform = transform_pipeline or get_transform_pipeline(model_name)
+    train_loader = load_data(
+        train_split,
+        transform_pipeline=transform,
+        return_dataloader=True,
+        num_workers=num_workers,
+        batch_size=batch_size,
+        shuffle=True,
+    )
+    val_loader = load_data(
+        val_split,
+        transform_pipeline=transform,
+        return_dataloader=True,
+        num_workers=num_workers,
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    model = load_model(model_name, with_weights=False).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epoch)
+
+    best_val = math.inf
+    best_metrics: dict[str, float] | None = None
+
+    for epoch in range(1, num_epoch + 1):
+        print(f"Epoch {epoch}/{num_epoch}")
+        train_loss, train_metrics = run_epoch(model_name, model, train_loader, optimizer, device, desc="train")
+        val_loss, val_metrics = run_epoch(model_name, model, val_loader, None, device, desc="val")
+
+        print(f"  train: loss={train_loss:.4f} lon={train_metrics['longitudinal_error']:.3f} lat={train_metrics['lateral_error']:.3f}")
+        print(f"  val  : loss={val_loss:.4f} lon={val_metrics['longitudinal_error']:.3f} lat={val_metrics['lateral_error']:.3f}")
+
+        lr_scheduler.step()
+
+        if val_loss < best_val:
+            best_val = val_loss
+            best_metrics = val_metrics
+            if save:
+                out_path = save_model(model)
+                print(f"  Saved checkpoint to {out_path}")
+
+    return best_metrics or {}
+
+
 def main():
     parser = argparse.ArgumentParser("Train planners for Homework 4")
     parser.add_argument("--model", type=str, default="mlp_planner", choices=["mlp_planner", "transformer_planner", "cnn_planner"]) 
