@@ -263,3 +263,32 @@ class EgoTrackProcessor:
             "waypoints": waypoints.astype(np.float32),
             "waypoints_mask": waypoints_mask,
         }
+
+
+class NormalizeImage:
+    """Normalize 'image' in sample dict using mean/std."""
+    def __init__(self, mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)):
+        import numpy as np
+        self.mean = np.array(mean, dtype=np.float32)[None, None, :]
+        self.std = np.array(std, dtype=np.float32)[None, None, :]
+    def __call__(self, sample: dict):
+        if 'image' in sample and sample['image'] is not None:
+            img = sample['image'].astype('float32')
+            if img.max() > 1.0:
+                img = img / 255.0
+            sample['image'] = (img - self.mean) / self.std
+        return sample
+
+class ToTensor:
+    """Convert arrays in sample dict to torch tensors with channels-first for 'image'."""
+    def __call__(self, sample: dict):
+        import torch, numpy as np
+        if 'image' in sample and sample['image'] is not None:
+            img = sample['image']
+            if isinstance(img, np.ndarray):
+                img = torch.from_numpy(img).permute(2,0,1).contiguous().float()
+            sample['image'] = img
+        for key in ['track_left','track_right','waypoints','waypoints_mask']:
+            if key in sample and sample[key] is not None and not torch.is_tensor(sample[key]):
+                sample[key] = torch.from_numpy(sample[key]).float() if key != 'waypoints_mask' else torch.from_numpy(sample[key]).bool()
+        return sample
