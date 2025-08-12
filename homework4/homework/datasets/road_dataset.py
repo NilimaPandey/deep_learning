@@ -109,7 +109,7 @@ class RoadDataset(Dataset):
         # Compose transform
         if transform_pipeline == "default":
             self.transform = road_transforms.Compose([
-                road_transforms.ImageLoader(None),      # episode set in __getitem__
+                road_transforms.ImageLoader(self.episode_dirs[0]),      # episode set in __getitem__
                 road_transforms.EgoTrackProcessor(self.episode_tracks[0]),
                 road_transforms.NormalizeImage(),
                 road_transforms.ToTensor(),
