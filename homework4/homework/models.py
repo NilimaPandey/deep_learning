@@ -41,23 +41,53 @@ class MLPPlanner(nn.Module):
 
 # -------- Transformer (decoder) ------
 class TransformerPlanner(nn.Module):
-    def __init__(self, n_track: int = 10, n_waypoints: int = 3, d_model=128, nhead=4, num_layers=2, ff=256, dropout=0.1):
+    """
+    State-only planner: encodes left/right track points, decodes N waypoints.
+    """
+    def __init__(self, n_track: int = 10, n_waypoints: int = 3,
+                 d_model=256, nhead=8, num_layers=4, ff=512, dropout=0.1):
         super().__init__()
         self.n_waypoints = n_waypoints
+        self.d_model = d_model
+
+        # project (x, y) -> d_model
         self.input_proj = nn.Linear(2, d_model)
-        self.pos_left = nn.Parameter(torch.randn(1, n_track, d_model) * 0.02)
-        self.pos_right = nn.Parameter(torch.randn(1, n_track, d_model) * 0.02)
+
+        # positional (by index) and side (left/right) embeddings
+        self.pos_embed = nn.Parameter(torch.randn(1, n_track, d_model) * 0.02)
+        self.side_embed = nn.Embedding(2, d_model)  # 0 = left, 1 = right
+
+        # encode concatenated [left; right] track tokens
+        enc_layer = nn.TransformerEncoderLayer(d_model, nhead, ff, dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+        # learned queries for each waypoint
         self.query_embed = nn.Embedding(n_waypoints, d_model)
-        dec_layer = nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward=ff, dropout=dropout, batch_first=True)
+
+        # cross-attend queries to encoded memory
+        dec_layer = nn.TransformerDecoderLayer(d_model, nhead, ff, dropout, batch_first=True)
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=num_layers)
+
         self.out_proj = nn.Linear(d_model, 2)
+
     def forward(self, track_left, track_right):
-        tl = self.input_proj(track_left) + self.pos_left
-        tr = self.input_proj(track_right) + self.pos_right
-        mem = torch.cat([tl, tr], dim=1)
-        q = self.query_embed.weight.unsqueeze(0).expand(track_left.size(0), -1, -1)
-        hs = self.decoder(q, mem)
-        return self.out_proj(hs)
+        """
+        track_left/right: (B, n_track, 2)
+        returns: (B, n_waypoints, 2)
+        """
+        B, N, _ = track_left.shape
+
+        # embeddings for left/right
+        tl = self.input_proj(track_left) + self.pos_embed[:, :N, :] + self.side_embed.weight[0].view(1, 1, -1)
+        tr = self.input_proj(track_right) + self.pos_embed[:, :N, :] + self.side_embed.weight[1].view(1, 1, -1)
+
+        mem = torch.cat([tl, tr], dim=1)          # (B, 2N, d_model)
+        mem = self.encoder(mem)                   # encode the track context
+
+        q = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)  # (B, n_wp, d_model)
+        hs = self.decoder(q, mem)                 # (B, n_wp, d_model)
+        return self.out_proj(hs)                  # (B, n_wp, 2)
+
 
 # ---------------- CNN ----------------
 # --- in homework/models.py ---
