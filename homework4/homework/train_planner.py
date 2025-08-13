@@ -33,17 +33,25 @@ def make_loader(split_path: str, transform_pipeline: str, batch_size: int, num_w
     )
 
 
+# add near the top
 import torch.nn.functional as F
 
-def masked_smooth_l1_loss(preds: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor, beta: float = 1.0) -> torch.Tensor:
-    # preds/targets: (B, n, 2), mask: (B, n)
-    diff = preds - targets
-    mask2 = mask.unsqueeze(-1).to(diff.dtype)
+def masked_smooth_l1_loss(preds, targets, mask, beta: float = 1.0, lat_weight: float = 2.0):
+    """
+    Weighted Smooth L1 (Huber) over valid waypoints.
+    lat_weight > 1.0 puts extra emphasis on lateral (y) error.
+    """
+    diff = preds - targets                     # (B, n, 2)
+    mask2 = mask.unsqueeze(-1).to(diff.dtype)  # (B, n, 1)
     diff = diff * mask2
-    # Smooth L1 on the masked elements
-    loss = F.smooth_l1_loss(diff, torch.zeros_like(diff), beta=beta, reduction='sum')
+
+    loss_x = F.smooth_l1_loss(diff[..., 0], torch.zeros_like(diff[..., 0]),
+                              beta=beta, reduction="sum")
+    loss_y = F.smooth_l1_loss(diff[..., 1], torch.zeros_like(diff[..., 1]),
+                              beta=beta, reduction="sum")
     denom = mask2.sum().clamp_min(1.0)
-    return loss / denom
+    return (loss_x + lat_weight * loss_y) / denom
+
 
 
 def train_one_epoch(model, loader, optimizer, device):
@@ -66,7 +74,8 @@ def train_one_epoch(model, loader, optimizer, device):
         targets = batch["waypoints"].to(device, non_blocking=True)
         mask = batch["waypoints_mask"].to(device, non_blocking=True).bool()
 
-        loss = masked_smooth_l1_loss(preds, targets, mask)   # in train_one_epoch
+        loss = masked_smooth_l1_loss(preds, targets, mask, beta=1.0, lat_weight=2.0)
+   # in train_one_epoch
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
@@ -97,7 +106,7 @@ def evaluate(model, loader, device):
         targets = batch["waypoints"].to(device, non_blocking=True)
         mask = batch["waypoints_mask"].to(device, non_blocking=True).bool()
 
-        loss = masked_mse_loss(preds, targets, mask)
+        loss = masked_smooth_l1_loss(preds, targets, mask, beta=1.0, lat_weight=2.0)
         total_loss += float(loss.item())
         metric.update(preds, targets, mask)
 
