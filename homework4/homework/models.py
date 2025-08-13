@@ -88,6 +88,34 @@ class BasicBlock(nn.Module):
             x = self.down(x)
         return self.relu(x + y)
 
+# --- homework/models.py ---
+import torch
+import torch.nn as nn
+
+class BasicBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.down = None
+        if stride != 1 or in_ch != out_ch:
+            self.down = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, stride, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        y = self.conv(x)
+        if self.down is not None:
+            x = self.down(x)
+        return self.relu(x + y)
+
 class CNNPlanner(nn.Module):
     """
     Image-only planner: image (B,3,H,W) -> waypoints (B, n_wp, 2)
@@ -103,7 +131,7 @@ class CNNPlanner(nn.Module):
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         ]
-        # 1/4, 1/8, 1/16 stages with residual blocks
+        # Residual stages at 1/4, 1/8, 1/16
         channels = [32, 64, 128, 256]
         strides  = [1,   2,   2,   2]
         in_ch = 32
@@ -112,7 +140,6 @@ class CNNPlanner(nn.Module):
             in_ch = out_ch
         self.backbone = nn.Sequential(*layers)
 
-        # Head
         self.head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -123,19 +150,17 @@ class CNNPlanner(nn.Module):
         )
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
-        x = self.backbone(image)
+        x = self.backbone(image)                # already normalized by pipeline
         out = self.head(x)
         return out.view(image.size(0), self.n_waypoints, 2)
-
-
-
 
 MODEL_FACTORY = {
     'linear_planner': LinearPlanner,
     'mlp_planner': MLPPlanner,
     'transformer_planner': TransformerPlanner,
-    'cnn_planner': CNNPlanner,
+    'cnn_planner': CNNPlanner,       # <-- ensure this exists
 }
+
 
 def build_model(name: str) -> nn.Module:
     if name not in MODEL_FACTORY:
