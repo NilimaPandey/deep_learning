@@ -33,13 +33,17 @@ def make_loader(split_path: str, transform_pipeline: str, batch_size: int, num_w
     )
 
 
-def masked_mse_loss(preds: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """MSE averaged only over valid (masked) waypoints."""
-    diff2 = (preds - targets) ** 2  # (B, n, 2)
-    mask2 = mask.unsqueeze(-1).to(diff2.dtype)
-    diff2 = diff2 * mask2
+import torch.nn.functional as F
+
+def masked_smooth_l1_loss(preds: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor, beta: float = 1.0) -> torch.Tensor:
+    # preds/targets: (B, n, 2), mask: (B, n)
+    diff = preds - targets
+    mask2 = mask.unsqueeze(-1).to(diff.dtype)
+    diff = diff * mask2
+    # Smooth L1 on the masked elements
+    loss = F.smooth_l1_loss(diff, torch.zeros_like(diff), beta=beta, reduction='sum')
     denom = mask2.sum().clamp_min(1.0)
-    return diff2.sum() / denom
+    return loss / denom
 
 
 def train_one_epoch(model, loader, optimizer, device):
@@ -62,7 +66,7 @@ def train_one_epoch(model, loader, optimizer, device):
         targets = batch["waypoints"].to(device, non_blocking=True)
         mask = batch["waypoints_mask"].to(device, non_blocking=True).bool()
 
-        loss = masked_mse_loss(preds, targets, mask)
+        loss = masked_smooth_l1_loss(preds, targets, mask)   # in train_one_epoch
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
@@ -130,6 +134,7 @@ def train(
     # CHANGED: add weight decay + cosine schedule
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epoch)
+
 
     best_l1 = float("inf")
     best_path = None
